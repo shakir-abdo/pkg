@@ -1,7 +1,8 @@
+import { createBrotliCompress, createGzip } from 'zlib';
 import Multistream from 'multistream';
 import assert from 'assert';
-import { execSync } from 'child_process';
-import fs from 'fs';
+import { execFileSync } from 'child_process';
+import fs from 'fs-extra';
 import intoStream from 'into-stream';
 import path from 'path';
 import streamMeter from 'stream-meter';
@@ -12,6 +13,7 @@ import { log, wasReported } from './log';
 import { fabricateTwice } from './fabricator';
 import { platform, SymLinks, Target } from './types';
 import { Stripe } from './packer';
+import { CompressType } from './compress_type';
 
 interface NotFound {
   notFound: true;
@@ -196,7 +198,7 @@ function findPackageJson(nodeFile: string) {
 }
 
 function nativePrebuildInstall(target: Target, nodeFile: string) {
-  const prebuild = path.join(
+  const prebuildInstall = path.join(
     __dirname,
     '../node_modules/.bin/prebuild-install'
   );
@@ -208,30 +210,36 @@ function nativePrebuildInstall(target: Target, nodeFile: string) {
     throw new Error(`Couldn't find node version, instead got: ${nodeVersion}`);
   }
 
-  // prebuild-install will overwrite the target .node file. Instead, we're
-  // going to:
-  //  * Take a backup
-  //  * run prebuild
-  //  * move the prebuild to a new name with a platform/version extension
-  //  * put the backed up file back
   const nativeFile = `${nodeFile}.${target.platform}.${nodeVersion}`;
 
   if (fs.existsSync(nativeFile)) {
     return nativeFile;
   }
 
+  // prebuild-install will overwrite the target .node file, so take a backup
   if (!fs.existsSync(`${nodeFile}.bak`)) {
     fs.copyFileSync(nodeFile, `${nodeFile}.bak`);
   }
 
-  execSync(
-    `${prebuild} -t ${nodeVersion} --platform ${
-      platform[target.platform]
-    } --arch ${target.arch}`,
+  // run prebuild
+  execFileSync(
+    prebuildInstall,
+    [
+      '--target',
+      nodeVersion,
+      '--platform',
+      platform[target.platform],
+      '--arch',
+      target.arch,
+    ],
     { cwd: dir }
   );
+
+  // move the prebuild to a new name with a platform/version extension
   fs.copyFileSync(nodeFile, nativeFile);
-  fs.copyFileSync(`${nodeFile}.bak`, nodeFile);
+
+  // put the backed up file back
+  fs.moveSync(`${nodeFile}.bak`, nodeFile, { overwrite: true });
 
   return nativeFile;
 }
@@ -242,6 +250,61 @@ interface ProducerOptions {
   slash: string;
   target: Target;
   symLinks: SymLinks;
+  doCompress: CompressType;
+}
+
+/**
+ * instead of creating a vfs dicionnary with actual path as key
+ * we use a compression mechanism that can reduce significantly
+ * the memory footprint of the vfs in the code.
+ *
+ * without vfs compression:
+ *
+ * vfs = {
+ *   "/folder1/folder2/file1.js": {};
+ *   "/folder1/folder2/folder3/file2.js": {};
+ *   "/folder1/folder2/folder3/file3.js": {};
+ * }
+ *
+ * with compression :
+ *
+ * fileDictionary = {
+ *    "folder1": "1",
+ *    "folder2": "2",
+ *    "file1": "3",
+ *    "folder3": "4",
+ *    "file2": "5",
+ *    "file3": "6",
+ * }
+ * vfs = {
+ *   "/1/2/3": {};
+ *   "/1/2/4/5": {};
+ *   "/1/2/4/6": {};
+ * }
+ *
+ * note: the key is computed in base36 for further compression.
+ */
+const fileDictionary: { [key: string]: string } = {};
+let counter = 0;
+function getOrCreateHash(fileOrFolderName: string) {
+  let existingKey = fileDictionary[fileOrFolderName];
+  if (!existingKey) {
+    const newkey = counter;
+    counter += 1;
+    existingKey = newkey.toString(36);
+    fileDictionary[fileOrFolderName] = existingKey;
+  }
+  return existingKey;
+}
+const separator = '/';
+
+function makeKey(
+  doCompression: CompressType,
+  fullpath: string,
+  slash: string
+): string {
+  if (doCompression === CompressType.None) return fullpath;
+  return fullpath.split(slash).map(getOrCreateHash).join(separator);
 }
 
 export default function producer({
@@ -250,6 +313,7 @@ export default function producer({
   slash,
   target,
   symLinks,
+  doCompress,
 }: ProducerOptions) {
   return new Promise<void>((resolve, reject) => {
     if (!Buffer.alloc) {
@@ -268,10 +332,8 @@ export default function producer({
     for (const stripe of stripes) {
       let { snap } = stripe;
       snap = snapshotify(snap, slash);
-
-      if (!vfs[snap]) {
-        vfs[snap] = {};
-      }
+      const vfsKey = makeKey(doCompress, snap, slash);
+      if (!vfs[vfsKey]) vfs[vfsKey] = {};
     }
 
     const snapshotSymLinks: SymLinks = {};
@@ -279,7 +341,8 @@ export default function producer({
     for (const [key, value] of Object.entries(symLinks)) {
       const k = snapshotify(key, slash);
       const v = snapshotify(value, slash);
-      snapshotSymLinks[k] = v;
+      const vfsKey = makeKey(doCompress, k, slash);
+      snapshotSymLinks[vfsKey] = makeKey(doCompress, v, slash);
     }
 
     let meter: streamMeter.StreamMeter;
@@ -288,6 +351,15 @@ export default function producer({
     function pipeToNewMeter(s: Readable) {
       meter = streamMeter();
       return s.pipe(meter);
+    }
+    function pipeMayCompressToNewMeter(s: Readable): streamMeter.StreamMeter {
+      if (doCompress === CompressType.GZip) {
+        return pipeToNewMeter(s.pipe(createGzip()));
+      }
+      if (doCompress === CompressType.Brotli) {
+        return pipeToNewMeter(s.pipe(createBrotliCompress()));
+      }
+      return pipeToNewMeter(s);
     }
 
     function next(s: Readable) {
@@ -321,7 +393,8 @@ export default function producer({
           const { store } = prevStripe;
           let { snap } = prevStripe;
           snap = snapshotify(snap, slash);
-          vfs[snap][store] = [track, meter.bytes];
+          const vfsKey = makeKey(doCompress, snap, slash);
+          vfs[vfsKey][store] = [track, meter.bytes];
           track += meter.bytes;
         }
 
@@ -349,13 +422,17 @@ export default function producer({
 
                   cb(
                     null,
-                    pipeToNewMeter(intoStream(buffer || Buffer.from('')))
+                    pipeMayCompressToNewMeter(
+                      intoStream(buffer || Buffer.from(''))
+                    )
                   );
                 }
               );
             }
-
-            return cb(null, pipeToNewMeter(intoStream(stripe.buffer)));
+            return cb(
+              null,
+              pipeMayCompressToNewMeter(intoStream(stripe.buffer))
+            );
           }
 
           if (stripe.file) {
@@ -378,15 +455,17 @@ export default function producer({
                 if (fs.existsSync(platformFile)) {
                   return cb(
                     null,
-                    pipeToNewMeter(fs.createReadStream(platformFile))
+                    pipeMayCompressToNewMeter(fs.createReadStream(platformFile))
                   );
                 }
               } catch (err) {
                 log.debug(`prebuild-install failed[${stripe.file}]:`, err);
               }
             }
-
-            return cb(null, pipeToNewMeter(fs.createReadStream(stripe.file)));
+            return cb(
+              null,
+              pipeMayCompressToNewMeter(fs.createReadStream(stripe.file))
+            );
           }
 
           assert(false, 'producer: bad stripe');
@@ -401,15 +480,23 @@ export default function producer({
                   replaceDollarWise(
                     replaceDollarWise(
                       replaceDollarWise(
-                        prelude,
-                        '%VIRTUAL_FILESYSTEM%',
-                        JSON.stringify(vfs)
+                        replaceDollarWise(
+                          replaceDollarWise(
+                            prelude,
+                            '%VIRTUAL_FILESYSTEM%',
+                            JSON.stringify(vfs)
+                          ),
+                          '%DEFAULT_ENTRYPOINT%',
+                          JSON.stringify(entrypoint)
+                        ),
+                        '%SYMLINKS%',
+                        JSON.stringify(snapshotSymLinks)
                       ),
-                      '%DEFAULT_ENTRYPOINT%',
-                      JSON.stringify(entrypoint)
+                      '%DICT%',
+                      JSON.stringify(fileDictionary)
                     ),
-                    '%SYMLINKS%',
-                    JSON.stringify(snapshotSymLinks)
+                    '%DOCOMPRESS%',
+                    JSON.stringify(doCompress)
                   )
                 )
               )
